@@ -56,10 +56,10 @@ def get_terminal_dimensions(default_w=120, default_h=40):
 
 def render_frame_truecolor_chars(resized_rgb: np.ndarray, gray: np.ndarray, width: int, height: int, bg_color: bool = False) -> str:
     """
-    Высокоскоростная генерация кадра из букв, цифр и символов в TrueColor 24-bit ANSI.
+    Высокоскоростная генерация кадра из букв, цифр и символов в TrueColor 24-bit ANSI с гамма-коррекцией.
     """
-    # Вычисление индекса символа по яркости
-    indices = (gray.astype(np.float32) / 255.0 * (RAMP_LEN - 1)).astype(np.int32)
+    # Нелинейная гамма-коррекция 0.85 вытягивает тени и мелкие фактуры
+    indices = (np.power(gray.astype(np.float32) / 255.0, 0.85) * (RAMP_LEN - 1)).astype(np.int32)
     chars = RAMP_CHARS[indices]
     
     rows = []
@@ -150,15 +150,8 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
 
     term_w, term_h = get_terminal_dimensions()
     if width is None or width <= 0:
-        # Автоматическая ширина по размеру терминала
-        # Учитываем как ширину, так и высоту окна
-        w_by_width = term_w
-        if mode == 4:
-            # Half-block: каждая строка содержит 2 пикселя
-            w_by_height = int((term_h - 2) * 2 / aspect)
-        else:
-            w_by_height = int((term_h - 2) / (aspect * FONT_ASPECT))
-        width = max(30, min(w_by_width, w_by_height))
+        # Сверхширокое разрешение: заполняет всё окно терминала (не менее 160)
+        width = max(160, term_w)
 
     # Скрытие курсора и очистка экрана
     sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
@@ -199,9 +192,9 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
                     frame_idx = 0
                     t_start = time.perf_counter()
                 elif key in (b'+', b'='):
-                    width = min(term_w, width + 10)
+                    width = min(600, width + 20)
                 elif key in (b'-', b'_'):
-                    width = max(30, width - 10)
+                    width = max(30, width - 20)
 
             if paused:
                 time.sleep(0.05)
@@ -241,8 +234,9 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
                 fps_counter = 0
                 t_fps_measure = time.perf_counter()
 
-            # Преобразование кадра
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Улучшение сочности и контраста кадра для фотореалистичного цвета
+            frame_enhanced = cv2.convertScaleAbs(frame, alpha=1.12, beta=3)
+            frame_rgb = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2RGB)
 
             if mode == 4:
                 # Half-block: 2 вертикальных пикселя на строку

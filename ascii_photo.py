@@ -97,33 +97,50 @@ def clean_file_path(raw_str: str) -> Path:
     return Path(s)
 
 
-def preprocess_image(image: Image.Image, sharpness=1.4, contrast=1.2, brightness=1.0) -> Image.Image:
-    """Улучшает четкость и контраст изображения для максимальной детализации в ASCII."""
+def preprocess_image(image: Image.Image, sharpness=1.6, contrast=1.25, color_boost=1.2, brightness=1.0) -> Image.Image:
+    """
+    Максимальное качество: авто-уровни (autocontrast), насыщенность цвета,
+    микроконтраст и unsharp mask для предельной детализации мелких текстур.
+    """
     img = image.convert("RGB")
     
+    # 1. Автоматическое расширение динамического диапазона
+    try:
+        img = ImageOps.autocontrast(img, cutoff=0.5)
+    except Exception:
+        pass
+        
+    # 2. Насыщенность цвета (TrueColor 24-bit выглядит сочно и кинематографично)
+    if color_boost != 1.0:
+        img = ImageEnhance.Color(img).enhance(color_boost)
+        
+    # 3. Регулировка яркости
     if brightness != 1.0:
         img = ImageEnhance.Brightness(img).enhance(brightness)
         
+    # 4. Контраст (границы объектов и текстуры не сливаются)
     if contrast != 1.0:
         img = ImageEnhance.Contrast(img).enhance(contrast)
         
+    # 5. Повышение резкости и unsharp mask
     if sharpness != 1.0:
         img = ImageEnhance.Sharpness(img).enhance(sharpness)
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=2))
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=1))
         
     return img
 
 
 def render_ascii_truecolor(image: Image.Image, width: int, ramp=RAMP_LETTERS_DIGITS_SYMBOLS,
-                           contrast=1.2, sharpness=1.5, invert=False, bg_color=False):
+                           contrast=1.25, sharpness=1.6, invert=False, bg_color=False):
     """
-    Рендерит фото из цветных букв, цифр и символов в 24-bit TrueColor.
+    Рендерит фото из цветных букв, цифр и символов в 24-bit TrueColor с гамма-коррекцией.
     """
     orig_w, orig_h = image.size
     aspect = orig_h / orig_w
     height = max(1, int(width * aspect * FONT_ASPECT_RATIO))
     
-    img_sharpened = preprocess_image(image, sharpness=sharpness, contrast=contrast)
+    # Высококачественный ресайз Lanczos с предварительной обработкой
+    img_sharpened = preprocess_image(image, sharpness=sharpness, contrast=contrast, color_boost=1.2)
     img_resized = img_sharpened.resize((width, height), Image.Resampling.LANCZOS)
     
     ramp_len = len(ramp)
@@ -140,7 +157,9 @@ def render_ascii_truecolor(image: Image.Image, width: int, ramp=RAMP_LETTERS_DIG
         for x in range(width):
             r, g, b = pixels[x, y]
             
-            luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+            # Воспринимаемая яркость с нелинейной гамма-коррекцией (вытягивает тени и текстуры)
+            lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+            luminance = lum ** 0.85
             if invert:
                 luminance = 1.0 - luminance
                 
@@ -315,8 +334,8 @@ def save_html_viewer(html_content: str, output_path: Path, title="ASCII Photo"):
         }}
         pre#canvas {{
             font-family: "Consolas", "Courier New", "Cascadia Code", monospace;
-            font-size: 7px;
-            line-height: 7px;
+            font-size: 5px;
+            line-height: 5px;
             letter-spacing: 0px;
             white-space: pre;
             background: #000000;
@@ -328,19 +347,19 @@ def save_html_viewer(html_content: str, output_path: Path, title="ASCII Photo"):
     </style>
 </head>
 <body>
-    <div class="header">🎨 ASCII Photo Studio Viewer</div>
+    <div class="header">🎨 ASCII Photo Studio Viewer — Ultra-HD Resolution</div>
     <div class="sub">Сверхвысокое разрешение из букв, цифр и символов | Масштабируйте: Ctrl + Колесико мыши</div>
     <div class="controls">
         <button onclick="changeSize(1)">➕ Увеличить шрифт (+)</button>
         <button onclick="changeSize(-1)">➖ Уменьшить шрифт (-)</button>
-        <button onclick="resetSize()">↺ Исходный размер (7px)</button>
+        <button onclick="resetSize()">↺ Исходный размер (5px)</button>
         <button onclick="toggleInvert()">🌓 Инвертировать фон</button>
     </div>
     <div class="container">
         <pre id="canvas">{html_content}</pre>
     </div>
     <script>
-        let currentSize = 7;
+        let currentSize = 5;
         const canvas = document.getElementById('canvas');
         function changeSize(delta) {{
             currentSize = Math.max(1, currentSize + delta);
@@ -348,9 +367,9 @@ def save_html_viewer(html_content: str, output_path: Path, title="ASCII Photo"):
             canvas.style.lineHeight = currentSize + 'px';
         }}
         function resetSize() {{
-            currentSize = 7;
-            canvas.style.fontSize = '7px';
-            canvas.style.lineHeight = '7px';
+            currentSize = 5;
+            canvas.style.fontSize = '5px';
+            canvas.style.lineHeight = '5px';
         }}
         let inverted = false;
         function toggleInvert() {{
@@ -502,7 +521,8 @@ def main():
 
     current_image = None
     current_name = "photo"
-    current_width = get_terminal_width(120)
+    # Сверхвысокое разрешение по умолчанию: 200 символов (в 2 раза больше стандартного!)
+    current_width = max(200, get_terminal_width(200))
     current_mode = 1
 
     # Если файл передан сразу (например, перетаскивание на run.bat или через аргумент)
@@ -519,7 +539,8 @@ def main():
         print("  • Нажмите \x1b[1m[F]\x1b[0m — Выбрать фото или видео через окно проводника Windows")
         print("  • Нажмите \x1b[1m[C]\x1b[0m — Вставить фото из буфера обмена (Ctrl+C / скриншот)")
         if current_image is not None:
-            print(f"  • Нажмите \x1b[1m[W]\x1b[0m — Изменить разрешение/ширину (текущая: {current_width})")
+            print(f"  • Нажмите \x1b[1m[+] / [-]\x1b[0m — Увеличить / уменьшить размер (текущая ширина: \x1b[1;32m{current_width}\x1b[0m симв.)")
+            print(f"  • Нажмите \x1b[1m[W]\x1b[0m — Выбрать пресет разрешения (160 / 200 / 240 / 320 / 400)")
             print(f"  • Нажмите \x1b[1m[1-4]\x1b[0m — Перерисовать в другом режиме (1: Цвета, 2: Фон, 3: ЧБ, 4: Блоки)")
             print("  • Нажмите \x1b[1m[H]\x1b[0m — Открыть текущий арт в браузере (HTML)")
         print("  • Нажмите \x1b[1;31m[Q]\x1b[0m — Выйти")
@@ -548,6 +569,22 @@ def main():
         if cmd in ('q', 'quit', 'exit', 'й'):
             print("\nДо свидания!")
             break
+
+        if cmd in ('+', '='):
+            current_width = min(800, current_width + 40)
+            if current_image is not None:
+                draw_and_display(current_image, current_name, current_width, current_mode)
+            else:
+                print(f"\x1b[32mШирина увеличена до {current_width} символов.\x1b[0m")
+            continue
+
+        if cmd in ('-', '_'):
+            current_width = max(40, current_width - 40)
+            if current_image is not None:
+                draw_and_display(current_image, current_name, current_width, current_mode)
+            else:
+                print(f"\x1b[32mШирина уменьшена до {current_width} символов.\x1b[0m")
+            continue
 
         if cmd in ('f', 'file', 'а'):
             chosen = pick_file_dialog()
@@ -585,28 +622,37 @@ def main():
             draw_and_display(current_image, current_name, current_width, current_mode)
             continue
 
-        if current_image is not None and cmd in ('w', 'width', 'ц'):
-            print("\nВыберите ширину:")
-            print(f"  [1] По ширине терминала ({get_terminal_width(120)})")
-            print("  [2] Высокое (160 символов)")
-            print("  [3] Сверхвысокое (240 символов)")
-            print("  [4] Ультра (320 символов)")
-            print("  [Или введите свое число, например 200]")
-            w_choice = input("Ширина: ").strip()
+        if cmd in ('w', 'width', 'ц'):
+            print("\n\x1b[1;36mВыберите масштаб разрешения (ширина в символах):\x1b[0m")
+            print("  [1] Стандартное высокое (160 символов)")
+            print("  [2] \x1b[1;32mСверхвысокое (200 символов) — Оптимально для большинства фото\x1b[0m")
+            print("  [3] \x1b[1;35mУльтра-четкость (260 символов) — Максимальная детализация\x1b[0m")
+            print("  [4] \x1b[1;33mЭкстремальное 4K (340 символов) — Для огромных экранов\x1b[0m")
+            print("  [5] По ширине текущего окна консоли")
+            print("  [6] Ввести точное число вручную (например: 180, 280, 450)")
+            w_choice = input("Ваш выбор [1-6]: ").strip()
             if w_choice == '1':
-                current_width = get_terminal_width(120)
-            elif w_choice == '2':
                 current_width = 160
+            elif w_choice == '2':
+                current_width = 200
             elif w_choice == '3':
-                current_width = 240
+                current_width = 260
             elif w_choice == '4':
-                current_width = 320
-            else:
+                current_width = 340
+            elif w_choice == '5':
+                current_width = get_terminal_width(160)
+            elif w_choice == '6':
+                custom = input("Введите точную ширину: ").strip()
                 try:
-                    current_width = max(20, min(800, int(w_choice)))
+                    current_width = max(30, min(1000, int(custom)))
                 except ValueError:
-                    current_width = get_terminal_width(120)
-            draw_and_display(current_image, current_name, current_width, current_mode)
+                    current_width = 200
+            else:
+                current_width = 200
+            if current_image is not None:
+                draw_and_display(current_image, current_name, current_width, current_mode)
+            else:
+                print(f"\x1b[32mУстановлено разрешение: {current_width} символов в ширину.\x1b[0m")
             continue
 
         # В остальных случаях проверяем перетащенный путь к файлу
