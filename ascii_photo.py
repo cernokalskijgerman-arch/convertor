@@ -1,6 +1,6 @@
 """
-ASCII Photo Studio - Ультра-высокое разрешение фото в терминале из букв, цифр и символов.
-Поддерживает TrueColor 24-bit, буфер обмена (clipboard), Drag-and-Drop, выбор файла и экспорт в HTML.
+ASCII Photo & Video Studio - Сверхвысокое разрешение фото и видео в терминале.
+Поддерживает TrueColor 24-bit, буфер обмена (clipboard), Drag-and-Drop фото и видео, выбор файла и экспорт в HTML.
 """
 
 import os
@@ -11,6 +11,16 @@ import traceback
 import urllib.parse
 from pathlib import Path
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageGrab
+
+# Импорт видеоплеера
+try:
+    from ascii_video import play_video
+    VIDEO_SUPPORT = True
+except ImportError:
+    VIDEO_SUPPORT = False
+
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.gif', '.wmv', '.flv', '.m4v', '.3gp'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
 
 # Включение поддержки ANSI-цветов в консоли Windows (VT100 mode)
 def enable_windows_vt():
@@ -363,7 +373,7 @@ def save_html_viewer(html_content: str, output_path: Path, title="ASCII Photo"):
 
 
 def pick_file_dialog() -> str:
-    """Открывает стандартное диалоговое окно Windows для выбора изображения."""
+    """Открывает стандартное диалоговое окно Windows для выбора изображения или видео."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -371,10 +381,12 @@ def pick_file_dialog() -> str:
         root.withdraw()
         root.attributes('-topmost', True)
         filetypes = [
-            ("Изображения", "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif;*.tiff"),
+            ("Медиафайлы (Фото и Видео)", "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif;*.tiff;*.mp4;*.mkv;*.avi;*.mov;*.webm"),
+            ("Видеофайлы", "*.mp4;*.mkv;*.avi;*.mov;*.webm;*.gif;*.wmv;*.flv"),
+            ("Изображения", "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff"),
             ("Все файлы", "*.*")
         ]
-        path = filedialog.askopenfilename(title="Выберите фото для ASCII-режима", filetypes=filetypes)
+        path = filedialog.askopenfilename(title="Выберите фото или видео для ASCII-режима", filetypes=filetypes)
         root.destroy()
         return path
     except Exception as e:
@@ -400,11 +412,49 @@ def get_image_from_clipboard():
 def print_banner():
     banner = """
 \x1b[1;36m========================================================================\x1b[0m
-\x1b[1;37m        ASCII PHOTO STUDIO - ВЫСОКОЕ РАЗРЕШЕНИЕ В ТЕРМИНАЛЕ\x1b[0m
-\x1b[1;32m      Рендеринг любых фото из букв, цифр и символов в 24-bit TrueColor\x1b[0m
+\x1b[1;37m     ASCII PHOTO & VIDEO STUDIO - ВЫСОКОЕ РАЗРЕШЕНИЕ В ТЕРМИНАЛЕ\x1b[0m
+\x1b[1;32m   Рендеринг любых фото и видео из букв, цифр и символов в 24-bit TrueColor\x1b[0m
 \x1b[1;36m========================================================================\x1b[0m
 """
     print(banner)
+
+
+def handle_file(path: Path, current_width: int, current_mode: int):
+    """Определяет тип файла (фото или видео) и запускает соответствующий обработчик."""
+    ext = path.suffix.lower()
+    
+    # Видеофайл
+    if ext in VIDEO_EXTENSIONS:
+        if not VIDEO_SUPPORT:
+            print("\x1b[31m[!] Модуль ascii_video не найден или не установлен opencv-python.\x1b[0m")
+            return None, "video"
+        print(f"\x1b[32m✔ Запуск видео: {path.name}\x1b[0m")
+        play_video(path, width=current_width, mode=current_mode)
+        return None, path.stem
+
+    # Фото / изображение
+    try:
+        image = Image.open(path)
+        img_name = path.stem
+        print(f"\x1b[32m✔ Успешно загружено фото: {path.name} ({image.width}x{image.height} px)\x1b[0m")
+        draw_and_display(image, img_name, current_width, current_mode)
+        return image, img_name
+    except Exception as e:
+        # Проверяем, может это видео без стандартного расширения
+        if VIDEO_SUPPORT:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(str(path))
+                if cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 1:
+                    cap.release()
+                    print(f"\x1b[32m✔ Распознано как видео: {path.name}\x1b[0m")
+                    play_video(path, width=current_width, mode=current_mode)
+                    return None, path.stem
+                cap.release()
+            except Exception:
+                pass
+        print(f"\x1b[31m[!] Ошибка открытия файла '{path.name}': {e}\x1b[0m")
+        return None, "photo"
 
 
 def draw_and_display(image: Image.Image, img_name: str, width: int, mode: int):
@@ -457,19 +507,16 @@ def main():
 
     # Если файл передан сразу (например, перетаскивание на run.bat или через аргумент)
     if initial_file:
-        try:
-            current_image = Image.open(initial_file)
-            current_name = initial_file.stem
-            print(f"\x1b[32m✔ Загружено фото: {initial_file.name} ({current_image.width}x{current_image.height} px)\x1b[0m")
-            draw_and_display(current_image, current_name, current_width, current_mode)
-        except Exception as e:
-            print(f"\x1b[31m[!] Ошибка открытия файла: {e}\x1b[0m")
+        res_img, res_name = handle_file(initial_file, current_width, current_mode)
+        if res_img is not None:
+            current_image = res_img
+            current_name = res_name
 
     # Главный интерактивный цикл — ТЕРМИНАЛ НИКОГДА НЕ ЗАКРЫВАЕТСЯ САМ!
     while True:
         print("\n\x1b[1;33m--- ЧТО ДЕЛАТЬ ДАЛЬШЕ: ---\x1b[0m")
-        print("  • \x1b[1;32mПеретащите сюда фото (Drag & Drop)\x1b[0m прямо в это окно и нажмите Enter")
-        print("  • Нажмите \x1b[1m[F]\x1b[0m — Выбрать фото через окно проводника Windows")
+        print("  • \x1b[1;32mПеретащите сюда фото или видео (Drag & Drop)\x1b[0m прямо в это окно и нажмите Enter")
+        print("  • Нажмите \x1b[1m[F]\x1b[0m — Выбрать фото или видео через окно проводника Windows")
         print("  • Нажмите \x1b[1m[C]\x1b[0m — Вставить фото из буфера обмена (Ctrl+C / скриншот)")
         if current_image is not None:
             print(f"  • Нажмите \x1b[1m[W]\x1b[0m — Изменить разрешение/ширину (текущая: {current_width})")
@@ -493,7 +540,7 @@ def main():
                 print("\x1b[32m✔ Получено изображение из буфера обмена!\x1b[0m")
                 draw_and_display(current_image, current_name, current_width, current_mode)
             else:
-                print("\x1b[33mПеретащите файл картинки в окно и нажмите Enter, либо введите F / C.\x1b[0m")
+                print("\x1b[33mПеретащите файл фото или видео в окно и нажмите Enter, либо введите F / C.\x1b[0m")
             continue
 
         cmd = raw_input.lower()
@@ -507,13 +554,10 @@ def main():
             if chosen:
                 p = clean_file_path(chosen)
                 if p.is_file():
-                    try:
-                        current_image = Image.open(p)
-                        current_name = p.stem
-                        print(f"\x1b[32m✔ Загружено: {p.name}\x1b[0m")
-                        draw_and_display(current_image, current_name, current_width, current_mode)
-                    except Exception as e:
-                        print(f"\x1b[31mОшибка открытия фото: {e}\x1b[0m")
+                    res_img, res_name = handle_file(p, current_width, current_mode)
+                    if res_img is not None:
+                        current_image = res_img
+                        current_name = res_name
             continue
 
         if cmd in ('c', 'clip', 'v', 'paste', 'с', 'м'):
@@ -572,14 +616,10 @@ def main():
             print("\x1b[33mУбедитесь, что перетащили файл в окно или ввели правильный путь.\x1b[0m")
             continue
 
-        try:
-            current_image = Image.open(p)
-            current_name = p.stem
-            print(f"\x1b[32m✔ Успешно загружено фото: {p.name} ({current_image.width}x{current_image.height} px)\x1b[0m")
-            # Сразу отрисовываем без лишних вопросов!
-            draw_and_display(current_image, current_name, current_width, current_mode)
-        except Exception as e:
-            print(f"\x1b[31m[!] Ошибка открытия фото '{p.name}': {e}\x1b[0m")
+        res_img, res_name = handle_file(p, current_width, current_mode)
+        if res_img is not None:
+            current_image = res_img
+            current_name = res_name
 
 
 if __name__ == "__main__":

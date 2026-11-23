@@ -14,7 +14,7 @@ if %ERRORLEVEL% equ 0 (
 )
 
 if "%PYCMD%"=="" (
-    echo [!] Ошибка: Python не найден!
+    echo [!] Error: Python not found!
     pause
     exit /b 1
 )
