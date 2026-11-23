@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS / Temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# User-generated conversions (keep only sample)
+*_ascii.html
+*_ascii.txt
+!sample_photo_ascii.html
+!sample_photo_ascii.txt
+
+# Miscellaneous non-project files
+liquid-glass-skill/
+schedule.json
+index.html
