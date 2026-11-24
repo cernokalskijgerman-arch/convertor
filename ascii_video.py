@@ -9,6 +9,7 @@ import time
 import shutil
 import ctypes
 import msvcrt
+import threading
 import subprocess
 from pathlib import Path
 import cv2
@@ -32,105 +33,189 @@ class VideoAudioPlayer:
     def __init__(self, video_path: Path):
         self.video_path = video_path
         self.has_audio = False
+        self.audio_error = ""
         self.muted = False
         self.paused = False
         self.device = None
-        self.pcm_data = None
+        self.pcm_data = b""
+        self._pcm_view = None
         self.sample_rate = 44100
+        self.nchannels = 2
+        self.bytes_per_frame = 4  # 16-bit stereo = 4 bytes per frame
         self.cursor = 0
         self.total_samples = 0
+        self._lock = threading.Lock()
+        self._generator = None
 
         if not AUDIO_SUPPORTED:
+            self.audio_error = "av/miniaudio not installed"
             return
 
         try:
             self._extract_audio()
-        except Exception:
+        except Exception as e:
+            self.audio_error = str(e)
             self.has_audio = False
 
     def _extract_audio(self):
         container = av.open(str(self.video_path))
-        audio_streams = [s for s in container.streams if s.type == 'audio']
-        if not audio_streams:
-            container.close()
-            return
+        try:
+            audio_streams = [s for s in container.streams if s.type == 'audio']
+            if not audio_streams:
+                return
 
-        stream = audio_streams[0]
-        resampler = av.AudioResampler(format='s16', layout='stereo', rate=self.sample_rate)
+            stream = audio_streams[0]
+            src_rate = getattr(stream, "rate", None) or 44100
+            self.sample_rate = 44100 if src_rate == 44100 else 48000
+            resampler = av.AudioResampler(format='s16', layout='stereo', rate=self.sample_rate)
 
-        chunks = []
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                resampled_list = resampler.resample(frame)
-                for res_frame in resampled_list:
+            chunks = []
+            first_pts_handled = False
+
+            for packet in container.demux(stream):
+                try:
+                    frames = packet.decode()
+                except Exception:
+                    continue
+
+                for frame in frames:
+                    if not first_pts_handled:
+                        first_pts_handled = True
+                        if frame.pts is not None and stream.time_base is not None:
+                            try:
+                                start_sec = float(frame.pts * stream.time_base)
+                                if 0.05 < start_sec < 30.0:
+                                    pad_frames = int(start_sec * self.sample_rate)
+                                    chunks.append(b"\x00" * (pad_frames * self.bytes_per_frame))
+                            except Exception:
+                                pass
+                    try:
+                        resampled_list = resampler.resample(frame)
+                    except Exception:
+                        continue
+                    for res_frame in resampled_list:
+                        chunks.append(res_frame.to_ndarray().tobytes())
+
+            # Сброс остатка буфера ресемплера
+            try:
+                for res_frame in resampler.resample(None):
                     chunks.append(res_frame.to_ndarray().tobytes())
-
-        # Flush resampler
-        for res_frame in resampler.resample(None):
-            chunks.append(res_frame.to_ndarray().tobytes())
-
-        container.close()
+            except Exception:
+                pass
+        finally:
+            container.close()
 
         if chunks:
             self.pcm_data = b"".join(chunks)
-            self.total_samples = len(self.pcm_data) // 4  # 16-bit stereo = 4 bytes per frame
-            self.has_audio = self.total_samples > 0
+            self.total_samples = len(self.pcm_data) // self.bytes_per_frame
+            if self.total_samples > 0:
+                self._pcm_view = memoryview(self.pcm_data)
+                self.has_audio = True
+
+    def _audio_stream_generator(self):
+        """Генератор потока PCM-кадров для протокола miniaudio.PlaybackDevice."""
+        silence_cache = {}
+
+        def get_silence(nbytes: int) -> bytes:
+            buf = silence_cache.get(nbytes)
+            if buf is None:
+                buf = b"\x00" * nbytes
+                if len(silence_cache) < 32:
+                    silence_cache[nbytes] = buf
+            return buf
+
+        num_frames = yield b""
+        while True:
+            if not num_frames or num_frames <= 0:
+                num_frames = yield b""
+                continue
+
+            bytes_needed = num_frames * self.bytes_per_frame
+            with self._lock:
+                paused = self.paused
+                muted = self.muted
+                cursor = self.cursor
+                total = self.total_samples
+
+                # Курсор продвигается и в режиме mute, чтобы звук оставался синхронным при возврате
+                if not paused and cursor < total:
+                    frames_avail = min(num_frames, total - cursor)
+                    self.cursor = cursor + frames_avail
+                else:
+                    frames_avail = 0
+
+            if paused or muted or frames_avail == 0 or self._pcm_view is None:
+                num_frames = yield get_silence(bytes_needed)
+                continue
+
+            byte_start = cursor * self.bytes_per_frame
+            byte_end = byte_start + frames_avail * self.bytes_per_frame
+            if frames_avail == num_frames:
+                chunk = self._pcm_view[byte_start:byte_end]
+            else:
+                chunk = self.pcm_data[byte_start:byte_end] + get_silence(bytes_needed - (byte_end - byte_start))
+
+            num_frames = yield chunk
 
     def start(self):
         if not self.has_audio or not self.pcm_data:
             return
 
         try:
-            def playback_callback(device, num_frames):
-                if self.paused or self.muted or self.cursor >= self.total_samples:
-                    return b"\x00" * (num_frames * 4)
-
-                bytes_needed = num_frames * 4
-                byte_offset = self.cursor * 4
-                chunk = self.pcm_data[byte_offset : byte_offset + bytes_needed]
-
-                if len(chunk) < bytes_needed:
-                    chunk += b"\x00" * (bytes_needed - len(chunk))
-
-                self.cursor += num_frames
-                return chunk
+            self.stop()
+            gen = self._audio_stream_generator()
+            next(gen)
+            self._generator = gen
 
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=2,
+                nchannels=self.nchannels,
                 sample_rate=self.sample_rate,
-                data_format=miniaudio.StreamFormat.PCM
+                buffersize_msec=80,
             )
-            self.device.start(playback_callback)
-        except Exception:
+            self.device.start(gen)
+        except Exception as e:
+            self.audio_error = str(e)
             self.has_audio = False
             self.stop()
 
     def pause(self):
-        self.paused = True
+        with self._lock:
+            self.paused = True
 
     def resume(self):
-        self.paused = False
+        with self._lock:
+            self.paused = False
 
     def toggle_mute(self):
-        self.muted = not self.muted
-        return self.muted
+        with self._lock:
+            self.muted = not self.muted
+            return self.muted
 
     def seek_to_time(self, time_sec: float):
         if self.has_audio:
-            target_sample = int(time_sec * self.sample_rate)
-            self.cursor = max(0, min(self.total_samples, target_sample))
+            with self._lock:
+                target_sample = int(max(0.0, time_sec) * self.sample_rate)
+                self.cursor = max(0, min(self.total_samples, target_sample))
 
     def rewind(self):
-        self.cursor = 0
+        with self._lock:
+            self.cursor = 0
+
+    def get_time(self) -> float:
+        if not self.has_audio or self.sample_rate <= 0:
+            return 0.0
+        with self._lock:
+            return self.cursor / self.sample_rate
 
     def stop(self):
-        if self.device:
+        if self.device is not None:
             try:
                 self.device.close()
             except Exception:
                 pass
             self.device = None
+        self._generator = None
 
 # Включение VT100 ANSI режима в Windows
 def enable_windows_vt():
@@ -274,16 +359,18 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
 
     # Инициализация аудиоплеера (тихо отключается, если звука нет или аудио недоступно)
     audio_player = VideoAudioPlayer(video_path)
-    if audio_player.has_audio:
-        audio_player.start()
 
     # Скрытие курсора и очистка экрана
     sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
     sys.stdout.flush()
 
+    if audio_player.has_audio:
+        audio_player.start()
+
     show_fps = True
     paused = False
     frame_idx = 0
+    consecutive_eof = 0
     t_start = time.perf_counter()
     fps_counter = 0
     fps_display = orig_fps
@@ -300,31 +387,40 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
         while True:
             # Обработка клавиатуры в реальном времени (неблокирующий ввод)
             while msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key in (b'q', b'Q', b'\x1b'): # Q или Esc
+                key = msvcrt.getwch()
+                if key in ('\x00', '\xe0'):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                k_low = key.lower()
+                if k_low in ('q', 'й', '\x1b'):  # Q или Esc
                     return
-                elif key == b' ': # Пробел (пауза)
+                elif key == ' ':  # Пробел (пауза)
                     paused = not paused
                     if paused:
                         audio_player.pause()
                     else:
-                        t_start = time.perf_counter() - (frame_idx / orig_fps)
+                        video_time = frame_idx / orig_fps
+                        audio_player.seek_to_time(video_time)
+                        t_start = time.perf_counter() - video_time
                         audio_player.resume()
-                        audio_player.seek_to_time(frame_idx / orig_fps)
-                elif key in (b'm', b'M', b'\xec', b'\xcc'): # M (Вкл/Выкл звук)
+                elif k_low in ('m', 'ь'):  # M (Вкл/Выкл звук)
                     audio_player.toggle_mute()
-                elif key in (b'1', b'2', b'3', b'4'):
-                    mode = int(key.decode('ascii'))
-                elif key in (b'f', b'F', b'\xd4', b'\xf4'): # F (переключение оверлея FPS)
+                elif key in ('1', '2', '3', '4'):
+                    mode = int(key)
+                elif k_low in ('f', 'а'):  # F (переключение оверлея FPS)
                     show_fps = not show_fps
-                elif key in (b'r', b'R', b'\xca', b'\xea'): # R (перемотка в начало)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                elif k_low in ('r', 'к'):  # R (перемотка в начало)
+                    if not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                        cap.release()
+                        cap = cv2.VideoCapture(str(video_path))
                     frame_idx = 0
+                    consecutive_eof = 0
                     t_start = time.perf_counter()
                     audio_player.rewind()
-                elif key in (b'+', b'='):
+                elif key in ('+', '='):
                     width = min(600, width + 20)
-                elif key in (b'-', b'_'):
+                elif key in ('-', '_'):
                     width = max(30, width - 20)
 
             if paused:
@@ -339,9 +435,9 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
             # Пропуск отстающих кадров, если терминал не успевает
             if elapsed > target_time + (2.0 / orig_fps):
                 # Пропускаем чтение кадров
-                cap.grab()
-                frame_idx += 1
-                continue
+                if cap.grab():
+                    frame_idx += 1
+                    continue
 
             # Задержка, если рендеринг идет с опережением
             wait_time = target_time - elapsed
@@ -351,13 +447,20 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
             ret, frame = cap.read()
             if not ret:
                 if loop:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    consecutive_eof += 1
+                    if consecutive_eof > 1 or not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                        cap.release()
+                        cap = cv2.VideoCapture(str(video_path))
+                        if consecutive_eof > 3:
+                            break
                     frame_idx = 0
                     t_start = time.perf_counter()
                     audio_player.rewind()
                     continue
                 else:
                     break
+
+            consecutive_eof = 0
 
             frame_idx += 1
             fps_counter += 1
