@@ -9,9 +9,128 @@ import time
 import shutil
 import ctypes
 import msvcrt
+import subprocess
 from pathlib import Path
 import cv2
 import numpy as np
+
+# Безопасный импорт аудио-библиотек (av + miniaudio)
+try:
+    import av
+    import miniaudio
+    AUDIO_SUPPORTED = True
+except ImportError:
+    AUDIO_SUPPORTED = False
+
+
+class VideoAudioPlayer:
+    """
+    Безопасный аудиоплеер для видеофайлов на базе PyAV и miniaudio.
+    Если у видео нет звука или возникают ошибки аудиодрайвера, плеер
+    тихо отключается, гарантируя бесперебойное воспроизведение видео.
+    """
+    def __init__(self, video_path: Path):
+        self.video_path = video_path
+        self.has_audio = False
+        self.muted = False
+        self.paused = False
+        self.device = None
+        self.pcm_data = None
+        self.sample_rate = 44100
+        self.cursor = 0
+        self.total_samples = 0
+
+        if not AUDIO_SUPPORTED:
+            return
+
+        try:
+            self._extract_audio()
+        except Exception:
+            self.has_audio = False
+
+    def _extract_audio(self):
+        container = av.open(str(self.video_path))
+        audio_streams = [s for s in container.streams if s.type == 'audio']
+        if not audio_streams:
+            container.close()
+            return
+
+        stream = audio_streams[0]
+        resampler = av.AudioResampler(format='s16', layout='stereo', rate=self.sample_rate)
+
+        chunks = []
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                resampled_list = resampler.resample(frame)
+                for res_frame in resampled_list:
+                    chunks.append(res_frame.to_ndarray().tobytes())
+
+        # Flush resampler
+        for res_frame in resampler.resample(None):
+            chunks.append(res_frame.to_ndarray().tobytes())
+
+        container.close()
+
+        if chunks:
+            self.pcm_data = b"".join(chunks)
+            self.total_samples = len(self.pcm_data) // 4  # 16-bit stereo = 4 bytes per frame
+            self.has_audio = self.total_samples > 0
+
+    def start(self):
+        if not self.has_audio or not self.pcm_data:
+            return
+
+        try:
+            def playback_callback(device, num_frames):
+                if self.paused or self.muted or self.cursor >= self.total_samples:
+                    return b"\x00" * (num_frames * 4)
+
+                bytes_needed = num_frames * 4
+                byte_offset = self.cursor * 4
+                chunk = self.pcm_data[byte_offset : byte_offset + bytes_needed]
+
+                if len(chunk) < bytes_needed:
+                    chunk += b"\x00" * (bytes_needed - len(chunk))
+
+                self.cursor += num_frames
+                return chunk
+
+            self.device = miniaudio.PlaybackDevice(
+                output_format=miniaudio.SampleFormat.SIGNED16,
+                nchannels=2,
+                sample_rate=self.sample_rate,
+                data_format=miniaudio.StreamFormat.PCM
+            )
+            self.device.start(playback_callback)
+        except Exception:
+            self.has_audio = False
+            self.stop()
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        return self.muted
+
+    def seek_to_time(self, time_sec: float):
+        if self.has_audio:
+            target_sample = int(time_sec * self.sample_rate)
+            self.cursor = max(0, min(self.total_samples, target_sample))
+
+    def rewind(self):
+        self.cursor = 0
+
+    def stop(self):
+        if self.device:
+            try:
+                self.device.close()
+            except Exception:
+                pass
+            self.device = None
 
 # Включение VT100 ANSI режима в Windows
 def enable_windows_vt():
@@ -153,6 +272,11 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
         # Сверхширокое разрешение: заполняет всё окно терминала (не менее 160)
         width = max(160, term_w)
 
+    # Инициализация аудиоплеера (тихо отключается, если звука нет или аудио недоступно)
+    audio_player = VideoAudioPlayer(video_path)
+    if audio_player.has_audio:
+        audio_player.start()
+
     # Скрытие курсора и очистка экрана
     sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
     sys.stdout.flush()
@@ -181,8 +305,14 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
                     return
                 elif key == b' ': # Пробел (пауза)
                     paused = not paused
-                    if not paused:
+                    if paused:
+                        audio_player.pause()
+                    else:
                         t_start = time.perf_counter() - (frame_idx / orig_fps)
+                        audio_player.resume()
+                        audio_player.seek_to_time(frame_idx / orig_fps)
+                elif key in (b'm', b'M', b'\xec', b'\xcc'): # M (Вкл/Выкл звук)
+                    audio_player.toggle_mute()
                 elif key in (b'1', b'2', b'3', b'4'):
                     mode = int(key.decode('ascii'))
                 elif key in (b'f', b'F', b'\xd4', b'\xf4'): # F (переключение оверлея FPS)
@@ -191,6 +321,7 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     frame_idx = 0
                     t_start = time.perf_counter()
+                    audio_player.rewind()
                 elif key in (b'+', b'='):
                     width = min(600, width + 20)
                 elif key in (b'-', b'_'):
@@ -223,6 +354,7 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     frame_idx = 0
                     t_start = time.perf_counter()
+                    audio_player.rewind()
                     continue
                 else:
                     break
@@ -258,7 +390,11 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
 
             # Формирование информационного оверлея
             if show_fps:
-                info_line = f"\x1b[1;30;47m {video_path.name} | FPS: {fps_display:.1f}/{orig_fps:.1f} | Ширина: {width} | Режим [{mode}]: {mode_names.get(mode, '')} | [Пробел]=Пауза [1-4]=Режим [Q]=Выход \x1b[0m"
+                if audio_player.has_audio:
+                    snd_icon = "🔇 Звук: Выкл" if audio_player.muted else "🔊 Звук: Вкл"
+                else:
+                    snd_icon = "🔇 Без аудиодорожки"
+                info_line = f"\x1b[1;30;47m {video_path.name} | FPS: {fps_display:.1f}/{orig_fps:.1f} | {snd_icon} | Режим [{mode}]: {mode_names.get(mode, '')} | [Пробел]=Пауза [M]=Звук [Q]=Выход \x1b[0m"
             else:
                 info_line = ""
 
@@ -270,6 +406,7 @@ def play_video(video_path: Path, width: int = None, mode: int = 1, loop: bool = 
     except KeyboardInterrupt:
         pass
     finally:
+        audio_player.stop()
         cap.release()
         # Восстановление курсора и сброс цветов
         sys.stdout.write("\x1b[?25h\x1b[0m\n")

@@ -23,3 +23,6 @@ kwgt_formulas.txt
 platform-tools.zip
 platform-tools/
 widjet_repo/
+*.kwgt
+create_kwgt.py
+verify_audio.py
