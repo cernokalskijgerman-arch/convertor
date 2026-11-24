@@ -17,7 +17,7 @@ Thumbs.db
 # Miscellaneous non-project files
 liquid-glass-skill/
 schedule.json
-index.html
+/index.html
 auto_install.bat
 kwgt_formulas.txt
 platform-tools.zip
